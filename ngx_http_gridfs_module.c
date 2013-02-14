@@ -40,8 +40,8 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-#include "mongo-c-driver/src/mongo.h"
-#include "mongo-c-driver/src/gridfs.h"
+#include <mongo.h>
+#include <gridfs.h>
 #include <signal.h>
 #include <stdio.h>
 
@@ -485,23 +485,26 @@ static ngx_int_t ngx_http_mongo_add_connection(ngx_cycle_t* cycle, ngx_http_grid
         return NGX_ERROR;
     }
 
+    ngx_memzero(mongo_conn, sizeof(ngx_http_mongo_connection_t));
+
     mongo_conn->name = gridfs_loc_conf->mongo;
     mongo_conn->auths = ngx_array_create(cycle->pool, 4, sizeof(ngx_http_mongo_auth_t));
+    mongo_set_op_timeout( &mongo_conn->conn, 1000 );
 
     if ( gridfs_loc_conf->mongods->nelts == 1 ) {
         ngx_cpystrn( host, mongods[0].host.data, mongods[0].host.len + 1 );
-        status = mongo_connect( &mongo_conn->conn, (const char*)host, mongods[0].port );
+        status = mongo_client( &mongo_conn->conn, (const char*)host, mongods[0].port );
     } else if ( gridfs_loc_conf->mongods->nelts >= 2 && gridfs_loc_conf->mongods->nelts < 9 ) {
 
         /* Initiate replica set connection. */
-        mongo_replset_init( &mongo_conn->conn, (const char *)gridfs_loc_conf->replset.data );
+        mongo_replica_set_init( &mongo_conn->conn, (const char *)gridfs_loc_conf->replset.data );
 
         /* Add replica set seeds. */
         for( i=0; i<gridfs_loc_conf->mongods->nelts; ++i ) {
             ngx_cpystrn( host, mongods[i].host.data, mongods[i].host.len + 1 );
-            mongo_replset_add_seed( &mongo_conn->conn, (const char *)host, mongods[i].port );
+            mongo_replica_set_add_seed( &mongo_conn->conn, (const char *)host, mongods[i].port );
         }
-        status = mongo_replset_connect( &mongo_conn->conn );
+        status = mongo_replica_set_client( &mongo_conn->conn );
     } else {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                           "Mongo Nginx Exception: Too many strings provided in 'mongo' directive.");
@@ -570,7 +573,7 @@ static ngx_int_t ngx_http_gridfs_init_worker(ngx_cycle_t* cycle) {
 static ngx_int_t ngx_http_mongo_reconnect(ngx_log_t *log, ngx_http_mongo_connection_t *mongo_conn) {
     volatile int status = MONGO_CONN_FAIL;
 
-    if (&mongo_conn->conn.connected) { 
+    if (mongo_conn->conn.connected) {
         mongo_disconnect(&mongo_conn->conn);
         ngx_msleep(MONGO_RECONNECT_WAITTIME);
         status = mongo_reconnect(&mongo_conn->conn);
@@ -688,6 +691,7 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
     ngx_int_t rc = NGX_OK;
     bson query;
     bson_oid_t oid;
+    char oidhex[25];
     mongo_cursor ** cursors;
     gridfs_offset chunk_len;
     const char * chunk_data;
@@ -710,13 +714,13 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
                       "Mongo Connection not found: \"%V\"", &gridfs_conf->mongo);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-    
-    if ( !(&mongo_conn->conn.connected)
+
+    if ( mongo_check_connection(&mongo_conn->conn) != MONGO_OK
          && (ngx_http_mongo_reconnect(request->connection->log, mongo_conn) == NGX_ERROR
              || ngx_http_mongo_reauth(request->connection->log, mongo_conn) == NGX_ERROR)) {
         ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
                       "Could not connect to mongo: \"%V\"", &gridfs_conf->mongo);
-        if(&mongo_conn->conn.connected) { mongo_disconnect(&mongo_conn->conn); }
+        if(mongo_conn->conn.connected) { mongo_disconnect(&mongo_conn->conn); }
         return NGX_HTTP_SERVICE_UNAVAILABLE;
     }
 
@@ -755,13 +759,17 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
                         (const char*)gridfs_conf->db.data,
                         (const char*)gridfs_conf->root_collection.data,
                         &gfs) != MONGO_OK) {
-            e = TRUE; ecounter++;
-            if (ecounter > MONGO_MAX_RETRIES_PER_REQUEST
-                || ngx_http_mongo_reconnect(request->connection->log, mongo_conn) == NGX_ERROR
-                || ngx_http_mongo_reauth(request->connection->log, mongo_conn) == NGX_ERROR) {
-                ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
-                              "Mongo connection dropped, could not reconnect");
-                if(&mongo_conn->conn.connected) { mongo_disconnect(&mongo_conn->conn); }
+            e = TRUE;
+            if (mongo_conn->conn.err == MONGO_IO_ERROR && ecounter < MONGO_MAX_RETRIES_PER_REQUEST) {
+                if (ngx_http_mongo_reconnect(request->connection->log, mongo_conn) == NGX_ERROR
+                        || ngx_http_mongo_reauth(request->connection->log, mongo_conn) == NGX_ERROR) {
+                    ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
+                                  "Mongo connection dropped, could not reconnect");
+                    if(mongo_conn->conn.connected) { mongo_disconnect(&mongo_conn->conn); }
+                    ecounter = MONGO_MAX_RETRIES_PER_REQUEST;
+                }
+            }
+            if (++ecounter > MONGO_MAX_RETRIES_PER_REQUEST) {
                 free(value);
                 return NGX_HTTP_SERVICE_UNAVAILABLE;
             }
@@ -801,7 +809,7 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
     md5 = (char*)gridfile_get_md5(&gfile);
     last_modified = gridfile_get_uploaddate(&gfile);
 
-    // ---------- SEND THE HEADERS ---------- //
+    // ---------- PREPARE THE HEADERS ---------- //
 
     request->headers_out.status = NGX_HTTP_OK;
     request->headers_out.content_length_n = length;
@@ -846,9 +854,7 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
         request->headers_out.content_encoding->value.data = (u_char *) "gzip";
     }
 
-    ngx_http_send_header(request);
-
-    // ---------- SEND THE BODY ---------- //
+    // ---------- SEND THE BODY ( AND THE HEADERS ) ---------- //
 
     /* Empty file */
     if (numchunks == 0) {
@@ -871,6 +877,8 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
 
         gridfile_destroy(&gfile);
         gridfs_destroy(&gfs);
+
+        ngx_http_send_header(request);
 
         return ngx_http_output_filter(request, &out);
     }
@@ -914,16 +922,36 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
             e = FALSE;
             cursors[i] = gridfile_get_chunks(&gfile, i, 1);
             if (!(cursors[i] && mongo_cursor_next(cursors[i]) == MONGO_OK)) {
-                e = TRUE; ecounter++;
-                if (ecounter > MONGO_MAX_RETRIES_PER_REQUEST 
-                    || ngx_http_mongo_reconnect(request->connection->log, mongo_conn) == NGX_ERROR
-                    || ngx_http_mongo_reauth(request->connection->log, mongo_conn) == NGX_ERROR) {
-                    ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
-                                  "Mongo connection dropped, could not reconnect");
-                    if(&mongo_conn->conn.connected) { mongo_disconnect(&mongo_conn->conn); }
+                e = TRUE;
+                if (cursors[i] && mongo_conn->conn.err == MONGO_IO_ERROR && ecounter < MONGO_MAX_RETRIES_PER_REQUEST) {
+                    if (ngx_http_mongo_reconnect(request->connection->log, mongo_conn) == NGX_ERROR
+                         || ngx_http_mongo_reauth(request->connection->log, mongo_conn) == NGX_ERROR) {
+                        ngx_log_error(NGX_LOG_ERR, request->connection->log, 0,
+                                      "Mongo connection dropped, could not reconnect");
+                        if(mongo_conn->conn.connected) { mongo_disconnect(&mongo_conn->conn); }
+                        ecounter = MONGO_MAX_RETRIES_PER_REQUEST;
+                    }
+                }
+
+                if (++ecounter > MONGO_MAX_RETRIES_PER_REQUEST) {
+                    bson_find(&it, gfile.meta, "_id");
+                    bson_oid_to_string(bson_iterator_oid( &it ), oidhex);
+                    ngx_log_error(NGX_LOG_WARN, request->connection->log, 0, "Problem retrieve chunks, possible found a corrupted gridfs file, _id = \"%s\"", oidhex);
+
                     gridfile_destroy(&gfile);
                     gridfs_destroy(&gfs);
-                    return NGX_HTTP_SERVICE_UNAVAILABLE;
+
+                    if (i == 0) {
+                        return NGX_HTTP_SERVICE_UNAVAILABLE;
+                    } else {
+                        buffer->pos = NULL;
+                        buffer->last = NULL;
+                        buffer->memory = 1;
+                        buffer->last_buf = 1;
+                        out.buf = buffer;
+                        out.next = NULL;
+                        return ngx_http_output_filter(request, &out);
+                    }
                 }
             }
         } while (e);
@@ -940,6 +968,11 @@ static ngx_int_t ngx_http_gridfs_handler(ngx_http_request_t* request) {
         buffer->last_buf = (i == numchunks-1);
         out.buf = buffer;
         out.next = NULL;
+
+        if (i == 0) {
+            ngx_http_clear_content_length(request);
+            ngx_http_send_header(request);
+        }
 
         /* Serve the Chunk */
         rc = ngx_http_output_filter(request, &out);
